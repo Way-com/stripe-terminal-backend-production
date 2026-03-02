@@ -8,8 +8,6 @@ require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
 require 'rack/protection'
-require 'uri'
-require 'net/http'
 
 # Set the port from environment variable or default to 4567
 # This ensures compatibility with Railway, Render, Heroku, and other platforms
@@ -170,47 +168,6 @@ end
 # To create a PaymentIntent for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-payment-intents-server-side
 # Looks up or creates a Customer on your stripe account with the provided email
-# Calls the carwash API to verify the location using the JWT token sent by the client.
-# Returns the parsed location data on success, or nil on failure.
-def verify_location(token, location_id)
-  if token.nil? || token.empty?
-    log_info("verify_location: no token provided")
-    return nil
-  end
-  if location_id.nil? || location_id.empty?
-    log_info("verify_location: no location_id provided")
-    return nil
-  end
-
-  base_url = ENV['CARWASH_API_BASE_URL'] || 'https://carwash.way.com'
-  url = URI("#{base_url}/api/location/view-location/#{location_id}")
-
-  begin
-    https = Net::HTTP.new(url.host, url.port)
-    https.use_ssl = true
-    https.open_timeout = 5
-    https.read_timeout = 5
-
-    request = Net::HTTP::Get.new(url)
-    request['Authorization'] = "Bearer #{token}"
-    request['Content-Type'] = 'application/json'
-
-    response = https.request(request)
-    body = JSON.parse(response.body)
-
-    if response.code.to_i == 200 && body['status'] == true
-      log_info("verify_location: location #{location_id} verified successfully")
-      return body['data']
-    else
-      log_info("verify_location: API returned status #{response.code} - #{body['message']}")
-      return nil
-    end
-  rescue => e
-    log_info("verify_location: error calling carwash API - #{e.message}")
-    return nil
-  end
-end
-
 def lookupOrCreateCustomer(customerEmail)
   return nil if customerEmail.nil? || customerEmail.empty?
   
@@ -232,25 +189,6 @@ post '/create_payment_intent' do
   if !validationError.nil?
     status 400
     return log_info(validationError)
-  end
-
-  # Read the JWT token sent as a plain top-level field alongside other params
-  token = params[:token]
-
-  # Extract location_id from metadata (sent as metadata[location_id])
-  location_id = params[:metadata] && params[:metadata][:location_id]
-
-  # Verify the location via the carwash API using the token
-  if token && location_id
-    location_data = verify_location(token, location_id)
-    if location_data.nil?
-      status 401
-      content_type :json
-      return {:error => 'Unauthorized', :message => 'Could not verify location. Invalid or expired token.'}.to_json
-    end
-    log_info("Location verified: #{location_data['id']} - #{location_data['branch']}, #{location_data['city']}")
-  else
-    log_info("create_payment_intent: no token or location_id provided, skipping location verification")
   end
 
   begin
@@ -282,17 +220,7 @@ post '/create_payment_intent' do
     if params[:metadata] && !params[:metadata].empty?
       payment_intent_params[:metadata] = params[:metadata]
     end
-
-    # If the verified location has a stripe_account_id, route the payment
-    # to that connected account via transfer_data
-    if location_data && location_data['stripe_account_id'] && !location_data['stripe_account_id'].empty?
-      stripe_account_id = location_data['stripe_account_id']
-      payment_intent_params[:transfer_data] = { :destination => stripe_account_id }
-      log_info("PaymentIntent will be routed to connected account: #{stripe_account_id}")
-    else
-      log_info("No stripe_account_id on location, creating PaymentIntent normally")
-    end
-
+    
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
     
     # Update description to only contain the PaymentIntent ID
